@@ -41,6 +41,68 @@ struct M {
     server_stream: bool,
 }
 
+fn rest_path(pkg: &str, svc: &str, m: &prost_types::MethodDescriptorProto) -> (String, String) {
+    if let Some(opts) = &m.options {
+        use prost::Message;
+        let raw = opts.encode_to_vec();
+        if let Some(d) = find_field(&raw, 72295728) {
+            if let Some(p) = http_rule_path(d) {
+                return (p, "POST".to_string());
+            }
+        }
+    }
+    (format!("/{pkg}.{svc}/{}", m.name.clone().unwrap_or_default()), "POST".to_string())
+}
+
+fn find_field(data: &[u8], want: u64) -> Option<&[u8]> {
+    let mut i = 0;
+    while i < data.len() {
+        let (tag, ni) = read_var(data, i)?; i = ni;
+        let field = tag >> 3; let wt = tag & 7;
+        if wt == 2 {
+            let (len, ni2) = read_var(data, i)?; i = ni2;
+            if field == want { return Some(&data[i..i+len as usize]) }
+            i += len as usize;
+        } else if wt == 0 { let (_, ni) = read_var(data, i)?; i = ni; }
+        else if wt == 5 { i += 4 } else if wt == 1 { i += 8 }
+    }
+    None
+}
+
+fn http_rule_path(data: &[u8]) -> Option<String> {
+    parse_patterns(data)
+}
+
+fn parse_patterns(d: &[u8]) -> Option<String> {
+    let mut i = 0;
+    while i < d.len() {
+        let (tag, ni) = read_var(d, i)?; i = ni;
+        let field = tag >> 3; let wt = tag & 7;
+        if wt == 2 {
+            let (len, ni2) = read_var(d, i)?; i = ni2;
+            let val = String::from_utf8_lossy(&d[i..i+len as usize]).to_string();
+            i += len as usize;
+            if field == 2 { return Some(val) }
+            if field == 4 { return Some(val) }
+            if field == 3 { return Some(val) }
+            if field == 6 { return Some(val) }
+        } else if wt == 0 {
+            let (_, ni) = read_var(d, i)?; i = ni;
+        } else if wt == 5 { i += 4 } else if wt == 1 { i += 8 }
+    }
+    None
+}
+
+fn read_var(d: &[u8], mut i: usize) -> Option<(u64, usize)> {
+    let mut v = 0u64; let mut s = 0u32;
+    loop {
+        let b = *d.get(i)?; i += 1;
+        v |= ((b & 0x7f) as u64) << s; s += 7;
+        if b & 0x80 == 0 { return Some((v, i)) }
+        if s > 63 { return None }
+    }
+}
+
 fn last_type(t: &str) -> String { t.rsplit('.').next().unwrap_or(t).to_string() }
 
 fn collect_methods(f: &prost_types::FileDescriptorProto) -> Vec<M> {
@@ -50,12 +112,12 @@ fn collect_methods(f: &prost_types::FileDescriptorProto) -> Vec<M> {
         let svc_name = svc.name.clone().unwrap_or_default();
         for m in &svc.method {
             let name = m.name.clone().unwrap_or_default();
-            let path = format!("/{pkg}.{svc_name}/{name}");
+            let (path, verb) = rest_path(pkg.as_str(), &svc_name, m);
             out.push(M {
                 service: format!("{pkg}.{svc_name}"),
                 name,
                 path,
-                http_method: "POST".to_string(),
+                http_method: verb,
                 client_stream: m.client_streaming.unwrap_or(false),
                 server_stream: m.server_streaming.unwrap_or(false),
             });
