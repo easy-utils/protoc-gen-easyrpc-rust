@@ -1,35 +1,50 @@
 // protoc-gen-easyrpc-rust: read CodeGeneratorRequest and emit a `*_easyrpc.rs`
 // with a METHOD_SPECS table. Message types come from prost.
+//
+// REST paths: we use prost-reflect to resolve the `google.api.http` extension
+// option (field number 72295728) on each method. prost-types drops unknown /
+// extension option bytes on decode, so we deliberately build the
+// `FileDescriptorSet` straight from the RAW CodeGeneratorRequest bytes (each
+// proto_file payload is copied verbatim and rewrapped as field 1). That way the
+// extension payload is preserved, and `DescriptorPool::decode` can expose it as
+// a typed `google.api.http` HttpRule. We then read the verb (get/put/post/
+// delete/patch) and its path by field number/name via dynamic reflection.
+use std::io::{Read, Write};
+
 use prost::Message;
+use prost_reflect::DescriptorPool;
 use prost_types::compiler::{CodeGeneratorRequest, CodeGeneratorResponse, code_generator_response};
 
-use std::io::{Read, Write};
+const GOOGLE_API_HTTP: &str = "google.api.http";
 
 fn main() {
     let mut input = Vec::new();
-    std::io::stdin().read_to_end(&mut input).unwrap();
-    let req = CodeGeneratorRequest::decode(&input[..]).expect("decode request");
+    std::io::stdin().read_to_end(&mut input).expect("read stdin");
+    let req = CodeGeneratorRequest::decode(&input[..]).expect("decode CodeGeneratorRequest");
+
+    // Build a FileDescriptorSet from the raw proto_file payloads (field 15 of
+    // CodeGeneratorRequest), copying bytes verbatim so extension options are
+    // not stripped by any prost_types round-trip.
+    let fds_bytes = raw_file_descriptor_set(&input);
+
+    // DescriptorPool::decode (not from_file_descriptor_set) preserves extension
+    // options, which lets us resolve google.api.http on method options.
+    let pool = DescriptorPool::decode(fds_bytes.as_slice()).expect("build descriptor pool");
 
     let mut files = Vec::new();
-    for f in &req.proto_file {
-        if !req.file_to_generate.contains(&f.name.clone().unwrap_or_default()) {
-            continue;
-        }
-        let methods = collect_methods(f);
-        if methods.is_empty() {
-            continue;
-        }
-        let base = f.name.as_ref().map(|s| s.as_str()).unwrap_or("").trim_end_matches(".proto");
-        let content = render(&methods);
+    for name in &req.file_to_generate {
+        let Some(file) = pool.get_file_by_name(name) else { continue };
+        let methods = collect_methods(&pool, &file);
+        if methods.is_empty() { continue }
         files.push(code_generator_response::File {
-            name: Some(format!("{base}_easyrpc.rs")),
-            content: Some(content),
+            name: Some(format!("{}_easyrpc.rs", name.trim_end_matches(".proto"))),
+            content: Some(render(&methods)),
             ..Default::default()
         });
     }
 
     let resp = CodeGeneratorResponse { file: files, ..Default::default() };
-    std::io::stdout().write_all(&resp.encode_to_vec()).unwrap();
+    std::io::stdout().write_all(&resp.encode_to_vec()).expect("write stdout");
 }
 
 struct M {
@@ -41,89 +56,85 @@ struct M {
     server_stream: bool,
 }
 
-fn rest_path(pkg: &str, svc: &str, m: &prost_types::MethodDescriptorProto) -> (String, String) {
-    if let Some(opts) = &m.options {
-        use prost::Message;
-        let raw = opts.encode_to_vec();
-        if let Some(d) = find_field(&raw, 72295728) {
-            if let Some(p) = http_rule_path(d) {
-                return (p, "POST".to_string());
+/// Rewrap each CodeGeneratorRequest.proto_file (field 15) payload verbatim as a
+/// FileDescriptorSet.file (field 1) so extension option bytes survive.
+fn raw_file_descriptor_set(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < input.len() {
+        let (tag, ni) = read_var(input, i).unwrap_or((0, input.len()));
+        i = ni;
+        let field = tag >> 3;
+        let wt = tag & 7;
+        if wt == 2 {
+            let (len, ni2) = read_var(input, i).unwrap_or((0, input.len()));
+            i = ni2;
+            if field == 15 {
+                let payload = &input[i..i + len as usize];
+                out.push(0x0a); // FileDescriptorSet.file = field 1, length-delimited
+                out.extend_from_slice(&varint_len(len));
+                out.extend_from_slice(payload);
             }
+            i += len as usize;
+        } else {
+            i = skip_wire(input, i, wt);
         }
     }
-    (format!("/{pkg}.{svc}/{}", m.name.clone().unwrap_or_default()), "POST".to_string())
+    out
 }
 
-fn find_field(data: &[u8], want: u64) -> Option<&[u8]> {
-    let mut i = 0;
-    while i < data.len() {
-        let (tag, ni) = read_var(data, i)?; i = ni;
-        let field = tag >> 3; let wt = tag & 7;
-        if wt == 2 {
-            let (len, ni2) = read_var(data, i)?; i = ni2;
-            if field == want { return Some(&data[i..i+len as usize]) }
-            i += len as usize;
-        } else if wt == 0 { let (_, ni) = read_var(data, i)?; i = ni; }
-        else if wt == 5 { i += 4 } else if wt == 1 { i += 8 }
-    }
-    None
-}
-
-fn http_rule_path(data: &[u8]) -> Option<String> {
-    parse_patterns(data)
-}
-
-fn parse_patterns(d: &[u8]) -> Option<String> {
-    let mut i = 0;
-    while i < d.len() {
-        let (tag, ni) = read_var(d, i)?; i = ni;
-        let field = tag >> 3; let wt = tag & 7;
-        if wt == 2 {
-            let (len, ni2) = read_var(d, i)?; i = ni2;
-            let val = String::from_utf8_lossy(&d[i..i+len as usize]).to_string();
-            i += len as usize;
-            if field == 2 { return Some(val) }
-            if field == 4 { return Some(val) }
-            if field == 3 { return Some(val) }
-            if field == 6 { return Some(val) }
-        } else if wt == 0 {
-            let (_, ni) = read_var(d, i)?; i = ni;
-        } else if wt == 5 { i += 4 } else if wt == 1 { i += 8 }
-    }
-    None
-}
-
-fn read_var(d: &[u8], mut i: usize) -> Option<(u64, usize)> {
-    let mut v = 0u64; let mut s = 0u32;
-    loop {
-        let b = *d.get(i)?; i += 1;
-        v |= ((b & 0x7f) as u64) << s; s += 7;
-        if b & 0x80 == 0 { return Some((v, i)) }
-        if s > 63 { return None }
-    }
-}
-
-fn last_type(t: &str) -> String { t.rsplit('.').next().unwrap_or(t).to_string() }
-
-fn collect_methods(f: &prost_types::FileDescriptorProto) -> Vec<M> {
-    let pkg = f.package.clone().unwrap_or_default();
+fn collect_methods(pool: &DescriptorPool, file: &prost_reflect::FileDescriptor) -> Vec<M> {
+    let ext = pool.get_extension_by_name(GOOGLE_API_HTTP);
     let mut out = Vec::new();
-    for svc in &f.service {
-        let svc_name = svc.name.clone().unwrap_or_default();
-        for m in &svc.method {
-            let name = m.name.clone().unwrap_or_default();
-            let (path, verb) = rest_path(pkg.as_str(), &svc_name, m);
+    for service in file.services() {
+        let service_name = service.full_name().to_string();
+        for method in service.methods() {
+            let name = method.name().to_string();
+            let (path, verb) = method
+                .options()
+                .rest_path(ext.as_ref())
+                .unwrap_or_else(|| (format!("/{}/{}", service_name, name), "POST".to_string()));
             out.push(M {
-                service: format!("{pkg}.{svc_name}"),
+                service: service_name.clone(),
                 name,
                 path,
                 http_method: verb,
-                client_stream: m.client_streaming.unwrap_or(false),
-                server_stream: m.server_streaming.unwrap_or(false),
+                client_stream: method.method_descriptor_proto().client_streaming.unwrap_or(false),
+                server_stream: method.method_descriptor_proto().server_streaming.unwrap_or(false),
             });
         }
     }
     out
+}
+
+/// Read (path, verb) from a method's google.api.http extension option.
+///
+/// HttpRule verb fields (in order): get=2 put=3 post=4 delete=5 patch=6. We
+/// resolve by polling those field numbers on the dynamically-decoded HttpRule
+/// message, mirroring the oneof `pattern` in google.api.HttpRule.
+trait RestPath {
+    fn rest_path(&self, ext: Option<&prost_reflect::ExtensionDescriptor>) -> Option<(String, String)>;
+}
+
+impl RestPath for prost_reflect::DynamicMessage {
+    fn rest_path(&self, ext: Option<&prost_reflect::ExtensionDescriptor>) -> Option<(String, String)> {
+        let ext = ext?;
+        if !self.has_extension(ext) {
+            return None;
+        }
+        let rule = self.get_extension(ext);
+        let rule_msg = rule.as_message()?;
+        for (number, verb) in [(2u32, "GET"), (3, "PUT"), (4, "POST"), (5, "DELETE"), (6, "PATCH")] {
+            if let Some(value) = rule_msg.get_field_by_number(number) {
+                if let Some(path) = value.as_str() {
+                    if !path.is_empty() {
+                        return Some((path.to_string(), verb.to_string()));
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 fn render(methods: &[M]) -> String {
@@ -138,4 +149,35 @@ fn render(methods: &[M]) -> String {
     }
     s.push_str("  ]\n}\n");
     s
+}
+
+fn read_var(d: &[u8], mut i: usize) -> Option<(u64, usize)> {
+    let mut v = 0u64; let mut s = 0u32;
+    loop {
+        let b = *d.get(i)?; i += 1;
+        v |= ((b & 0x7f) as u64) << s; s += 7;
+        if b & 0x80 == 0 { return Some((v, i)) }
+        if s > 63 { return None }
+    }
+}
+
+fn skip_wire(data: &[u8], mut i: usize, wt: u64) -> usize {
+    match wt {
+        0 => { if let Some((_, ni)) = read_var(data, i) { i = ni } }
+        2 => { if let Some((len, ni)) = read_var(data, i) { i = ni + len as usize } }
+        5 => i += 4,
+        1 => i += 8,
+        _ => {}
+    }
+    i
+}
+
+fn varint_len(mut v: u64) -> Vec<u8> {
+    let mut o = Vec::new();
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 { o.push(b | 0x80) } else { o.push(b); break }
+    }
+    o
 }
