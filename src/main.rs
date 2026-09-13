@@ -43,7 +43,7 @@ fn main() {
         });
     }
 
-    let resp = CodeGeneratorResponse { file: files, ..Default::default() };
+    let resp = CodeGeneratorResponse { file: files, supported_features: Some(code_generator_response::Feature::Proto3Optional as u64), ..Default::default() };
     std::io::stdout().write_all(&resp.encode_to_vec()).expect("write stdout");
 }
 
